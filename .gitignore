@@ -5,5 +5,5 @@ __pycache__/
 *.db
 
 # Ignore all files in the Catalog/src/Awin/data directory
-src/Partners/Awin/data
-src/Offers/data
+src/Partners/Awin/data/
+src/Offers/data/
