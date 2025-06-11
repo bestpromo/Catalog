@@ -42,39 +42,6 @@ from db import connect_db as get_connection
 load_dotenv()
 BATCH_SIZE = int(os.getenv("AWIN_IMPORT_BATCH_SIZE", 50000))
 
-def is_importcsv_running():
-    result = subprocess.run(
-        ["pgrep", "-f", "ImportCsv.py"],
-        stdout=subprocess.PIPE
-    )
-    pids = [int(pid) for pid in result.stdout.decode().strip().split('\n') if pid.strip().isdigit()]
-    current_pid = os.getpid()
-    # Se existe algum PID (de ImportCsv.py), aborta
-    return any(pid != current_pid for pid in pids) or len(pids) > 0
-
-def is_self_running():
-    if os.path.exists(LOCKFILE):
-        with open(LOCKFILE, 'r') as f:
-            pid = f.read().strip()
-        if pid and pid.isdigit():
-            try:
-                os.kill(int(pid), 0)
-                logging.warning("Processo abortado: ImportStaging.py já está em execução.")
-                print("ImportStaging.py já está em execução. Abortando nova instância.")
-                sys.exit(0)
-            except OSError:
-                pass
-        os.remove(LOCKFILE)
-    with open(LOCKFILE, 'w') as f:
-        f.write(str(os.getpid()))
-
-if is_importcsv_running():
-    logging.warning("Processo abortado: ImportCsv.py está em execução.")
-    print("ImportCsv.py está em execução. Abortando ImportStaging.py.")
-    sys.exit(0)
-
-is_self_running()
-
 def parse_price(value):
     """Cleans and converts a text value to float."""
     if not value:
