@@ -20,7 +20,7 @@ atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "data", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(LOG_DIR, f"{datetime.now():%d%m%Y}.log")
+LOG_PATH = os.path.join(LOG_DIR, f"{datetime.now():%d%m%Y}-importCsv.log")
 
 def log(msg, icon="ℹ️"):
     log_line = f"{datetime.now():%d/%m/%Y %H:%M:%S} {icon} {msg}\n"
