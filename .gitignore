@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.db
+
+# Ignore all files in the Catalog/src/Awin/data directory
+src/Partners/Awin/data
+src/Offers/data
