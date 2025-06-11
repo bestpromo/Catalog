@@ -11,26 +11,18 @@ import re
 import io
 import subprocess
 
-def is_self_running():
-    result = subprocess.run(
-        ["pgrep", "-f", "ImportStaging.py"],
-        stdout=subprocess.PIPE
-    )
-    # Lista de PIDs encontrados
-    pids = [int(pid) for pid in result.stdout.decode().strip().split('\n') if pid.strip().isdigit()]
-    current_pid = os.getpid()
-    # Se existe algum outro PID diferente do atual, já está rodando
-    return any(pid != current_pid for pid in pids)
+# Lockfile atômico para evitar execuções simultâneas (robusto para uso com cron)
+LOCKFILE = '/tmp/importstaging.lock'
+try:
+    fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+except FileExistsError:
+    print("Processo abortado: ImportStaging.py já está em execução.")
+    sys.exit(0)
 
-def is_importcsv_running():
-    result = subprocess.run(
-        ["pgrep", "-f", "ImportCsv.py"],
-        stdout=subprocess.PIPE
-    )
-    pids = [int(pid) for pid in result.stdout.decode().strip().split('\n') if pid.strip().isdigit()]
-    current_pid = os.getpid()
-    # Se existe algum PID (de ImportCsv.py), aborta
-    return any(pid != current_pid for pid in pids) or len(pids) > 0
+import atexit
+atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "data", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -42,16 +34,6 @@ logging.basicConfig(
     datefmt="%d-%m-%Y %H:%M:%S"
 )
 
-if is_importcsv_running():
-    logging.warning("Processo abortado: ImportCsv.py está em execução.")
-    print("ImportCsv.py está em execução. Abortando ImportStaging.py.")
-    sys.exit(0)
-
-if is_self_running():
-    logging.warning("Processo abortado: ImportStaging.py já está em execução.")
-    print("ImportStaging.py já está em execução. Abortando nova instância.")
-    sys.exit(0)
-
 # Ajusta sys.path para importar connect_db corretamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from db import connect_db as get_connection
@@ -60,14 +42,15 @@ from db import connect_db as get_connection
 load_dotenv()
 BATCH_SIZE = int(os.getenv("AWIN_IMPORT_BATCH_SIZE", 50000))
 
-LOCKFILE = '/tmp/importstaging.lock'
-
 def is_importcsv_running():
     result = subprocess.run(
         ["pgrep", "-f", "ImportCsv.py"],
         stdout=subprocess.PIPE
     )
-    return result.returncode == 0
+    pids = [int(pid) for pid in result.stdout.decode().strip().split('\n') if pid.strip().isdigit()]
+    current_pid = os.getpid()
+    # Se existe algum PID (de ImportCsv.py), aborta
+    return any(pid != current_pid for pid in pids) or len(pids) > 0
 
 def is_self_running():
     if os.path.exists(LOCKFILE):
@@ -84,9 +67,6 @@ def is_self_running():
         os.remove(LOCKFILE)
     with open(LOCKFILE, 'w') as f:
         f.write(str(os.getpid()))
-
-import atexit
-atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
 if is_importcsv_running():
     logging.warning("Processo abortado: ImportCsv.py está em execução.")
