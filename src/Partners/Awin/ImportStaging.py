@@ -231,6 +231,7 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
     updated_processed_count = 0
     updated_error_count = 0
 
+    # Campos para INSERT (todos os campos)
     base_new_record_keys = [
         "created_at", "import_batch_id", "processed", "error_process", "reason_error",
         "processed_at", "partner_id", "partner_name", "merchant_id", "merchant_name",
@@ -241,7 +242,8 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
         "logistics", "stock_qty", "images", "raw_data", "gtin", "mpn", "ean",
         "isbn", "upc"
     ]
-    base_insert_data_keys = [
+    # Campos para UPDATE (apenas dados de oferta)
+    update_field_names = [
         "partner_id", "partner_name", "merchant_id", "merchant_name", "deep_link_url",
         "status", "merchant_deep_link_url", "is_adult", "sku", "offer_title",
         "condition", "offer_short_description", "offer_full_description", "offer_merchant_id",
@@ -294,14 +296,13 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
             # Atualizar todos os campos se processed = true
             if existing['processed'] is True:
                 staging_id = existing['staging_id']
-                # Aqui, defina explicitamente os valores para processed, error_process, reason_error
-                update_batch_values = list(insert_data.values()) + [None, None, None, staging_id]
+                update_batch_values = [insert_data[k] for k in update_field_names] + [None, None, None, staging_id]
                 update_processed_values.append(tuple(update_batch_values))
                 updated_processed_count += 1
             # Atualizar campos e marcar error_process = false se error_process = true e processed is null
             elif existing['error_process'] is True and existing['processed'] is None:
                 staging_id = existing['staging_id']
-                update_batch_values = list(insert_data.values()) + [False, staging_id]
+                update_batch_values = [insert_data[k] for k in update_field_names] + [False, staging_id]
                 update_error_values.append(tuple(update_batch_values))
                 updated_error_count += 1
             else:
@@ -315,20 +316,24 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
             insert_data_full_ordered["error_process"] = False
             insert_data_full_ordered["reason_error"] = None
             insert_data_full_ordered["processed_at"] = None
-            for key in base_insert_data_keys:
+            for key in update_field_names:
                 insert_data_full_ordered[key] = insert_data[key]
             if insert_columns is None:
                 insert_columns = base_new_record_keys
             insert_values.append(list(insert_data_full_ordered.values()))
-    return insert_values, insert_columns, update_processed_values, update_error_values, skipped_count, updated_processed_count, updated_error_count
+    return (
+        insert_values, insert_columns,
+        update_processed_values, update_error_values,
+        skipped_count, updated_processed_count, updated_error_count,
+        update_field_names
+    )
 
-def batch_update_processed_records(cur, update_processed_values, insert_data):
+def batch_update_processed_records(cur, update_processed_values, update_field_names):
     """Atualiza registros com processed=True (zera processed e error_process)."""
     if not update_processed_values:
         return 0
     update_set_parts = []
-    field_names = list(insert_data.keys())
-    for k in field_names:
+    for k in update_field_names:
         sql_col_name = f'"{k}"' if k in ["condition", "attributes"] else k
         update_set_parts.append(f"{sql_col_name} = %s")
     update_set_clause = ', '.join(update_set_parts)
@@ -340,17 +345,16 @@ def batch_update_processed_records(cur, update_processed_values, insert_data):
             reason_error = %s
         WHERE staging_id = %s
     """
-    # Cada tupla precisa ter: [todos os campos de insert_data] + [processed, error_process, reason_error, staging_id]
     cur.executemany(update_sql, update_processed_values)
     logging.info(f"Successfully updated {len(update_processed_values)} records that had processed=true.")
     return len(update_processed_values)
 
-def batch_update_error_records(cur, update_error_values, insert_data):
+def batch_update_error_records(cur, update_error_values, update_field_names):
     """Atualiza registros com error_process=True e processed is null."""
     if not update_error_values:
         return 0
     update_set_parts = []
-    for k in insert_data.keys():
+    for k in update_field_names:
         sql_col_name = f'"{k}"' if k in ["condition", "attributes"] else k
         update_set_parts.append(f"{sql_col_name} = %s")
     update_set_clause = ', '.join(update_set_parts)
@@ -449,9 +453,12 @@ def main():
         create_temp_keys_table(cur, offer_keys)
         existing_dict = fetch_existing_offers(cur)
 
-        insert_values, insert_columns, update_processed_values, update_error_values, skipped_count, updated_processed_count, updated_error_count = prepare_insert_and_update(
-            rows, existing_dict, partner_names
-        )
+        (
+            insert_values, insert_columns,
+            update_processed_values, update_error_values,
+            skipped_count, updated_processed_count, updated_error_count,
+            update_field_names
+        ) = prepare_insert_and_update(rows, existing_dict, partner_names)
 
         logging.info(f"Prepared {len(insert_values)} records for new insert.")
         logging.info(f"Prepared {updated_processed_count} records for processed update.")
@@ -460,11 +467,11 @@ def main():
 
         # Atualiza registros com processed = true
         if update_processed_values:
-            batch_update_processed_records(cur, update_processed_values, OrderedDict(insert_values[0]) if insert_values else OrderedDict())
+            batch_update_processed_records(cur, update_processed_values, update_field_names)
 
         # Atualiza registros com error_process = true e processed is null
         if update_error_values:
-            batch_update_error_records(cur, update_error_values, OrderedDict(insert_values[0]) if insert_values else OrderedDict())
+            batch_update_error_records(cur, update_error_values, update_field_names)
 
         # Insere novos registros
         inserted_count = batch_insert_copy(cur, insert_values, insert_columns)
