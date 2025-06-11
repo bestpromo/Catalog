@@ -1,21 +1,22 @@
 import sys
 import os
-import subprocess
 import csv
 import time
 from datetime import datetime
 from dotenv import load_dotenv
 
-def is_self_running():
-    result = subprocess.run(
-        ["pgrep", "-f", "ImportCsv.py"],
-        stdout=subprocess.PIPE
-    )
-    # Lista de PIDs encontrados
-    pids = [int(pid) for pid in result.stdout.decode().strip().split('\n') if pid.strip().isdigit()]
-    current_pid = os.getpid()
-    # Se existe algum outro PID diferente do atual, já está rodando
-    return any(pid != current_pid for pid in pids)
+# Lockfile atômico para evitar execuções simultâneas (robusto para uso com cron)
+LOCKFILE = '/tmp/importcsv.lock'
+try:
+    fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+except FileExistsError:
+    print("Processo abortado: ImportCsv.py já está em execução.")
+    sys.exit(0)
+
+import atexit
+atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "data", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -26,10 +27,6 @@ def log(msg, icon="ℹ️"):
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(log_line)
     print(log_line, end="")
-
-if is_self_running():
-    log("Processo abortado: ImportCsv.py já está em execução.", icon="⛔")
-    sys.exit(0)
 
 # Ajusta sys.path para importar connect_db corretamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -103,11 +100,9 @@ def prepare_table():
     """Run the script to create or truncate the import table."""
     sql_script_path = os.path.join(PROJECT_ROOT, 'sql', 'CreateOrTruncateStructure.py')
     log("Running CreateOrTruncateStructure.py to prepare table...", icon="🛠️")
-    result = subprocess.run(["python3", sql_script_path], capture_output=True, text=True)
-    if result.stdout:
-        log(result.stdout.strip())
-    if result.stderr:
-        log(result.stderr.strip(), icon="❗")
+    result = os.system(f"python3 {sql_script_path}")
+    if result != 0:
+        log("Erro ao executar CreateOrTruncateStructure.py", icon="❗")
 
 def main():
     start_total = time.time()
