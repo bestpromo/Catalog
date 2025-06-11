@@ -1,14 +1,19 @@
 import sys
 import os
-import subprocess
 from datetime import datetime
 
-def is_download_running():
-    result = subprocess.run(
-        ["pgrep", "-f", "DownloadOffers.py"],
-        stdout=subprocess.PIPE
-    )
-    return result.returncode == 0
+# Lockfile atômico para evitar execuções simultâneas (robusto para uso com cron)
+LOCKFILE = '/tmp/downloadoffers.lock'
+try:
+    fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+except FileExistsError:
+    print("Processo abortado: DownloadOffers.py já está em execução.")
+    sys.exit(0)
+
+import atexit
+atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
 # Diretórios e configurações para log
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -24,10 +29,6 @@ def log(msg, level="INFO"):
     with open(LOG_PATH, "a") as f:
         f.write(line + "\n")
 
-if is_download_running():
-    log("Processo abortado: DownloadOffers.py já está em execução.", level="WARNING")
-    sys.exit(0)
-
 # --- Carregue o .env ANTES de acessar as variáveis ---
 from dotenv import load_dotenv
 load_dotenv()
@@ -37,18 +38,11 @@ import gzip
 import shutil
 import requests
 
-from datetime import datetime
-
 # Diretórios e configurações
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 LISTS_DIR = os.path.join(DATA_DIR, 'list')
 FILES_DIR = os.path.join(DATA_DIR, 'files')
-LOGS_DIR = os.path.join(DATA_DIR, 'logs')
-
 os.makedirs(LISTS_DIR, exist_ok=True)
 os.makedirs(FILES_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
 
 AWIN_API_KEY = os.getenv("AWIN_API_KEY")
 AWIN_PUBLISHER_ID = os.getenv("AWIN_PUBLISHER_ID")
@@ -56,14 +50,6 @@ AWIN_LIST_URL = f"https://ui.awin.com/productdata-darwin-download/publisher/{AWI
 TODAY = datetime.now().strftime("%d-%m-%Y")
 LIST_FILENAME = f"{TODAY}-datafeed.csv"
 LIST_PATH = os.path.join(LISTS_DIR, LIST_FILENAME)
-LOG_PATH = os.path.join(LOGS_DIR, f"{datetime.now().strftime('%d%m%Y')}-downloadOffers.log")
-
-def log(msg, level="INFO"):
-    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    line = f"[{level}] {msg} ({now})"
-    print(line)
-    with open(LOG_PATH, "a") as f:
-        f.write(line + "\n")
 
 def download_and_extract(url, dest_csv):
     gz_path = dest_csv + ".gz"
