@@ -294,6 +294,7 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
             # Atualizar todos os campos se processed = true
             if existing['processed'] is True:
                 staging_id = existing['staging_id']
+                # Aqui, defina explicitamente os valores para processed, error_process, reason_error
                 update_batch_values = list(insert_data.values()) + [None, None, None, staging_id]
                 update_processed_values.append(tuple(update_batch_values))
                 updated_processed_count += 1
@@ -326,7 +327,8 @@ def batch_update_processed_records(cur, update_processed_values, insert_data):
     if not update_processed_values:
         return 0
     update_set_parts = []
-    for k in insert_data.keys():
+    field_names = list(insert_data.keys())
+    for k in field_names:
         sql_col_name = f'"{k}"' if k in ["condition", "attributes"] else k
         update_set_parts.append(f"{sql_col_name} = %s")
     update_set_clause = ', '.join(update_set_parts)
@@ -338,6 +340,7 @@ def batch_update_processed_records(cur, update_processed_values, insert_data):
             reason_error = %s
         WHERE staging_id = %s
     """
+    # Cada tupla precisa ter: [todos os campos de insert_data] + [processed, error_process, reason_error, staging_id]
     cur.executemany(update_sql, update_processed_values)
     logging.info(f"Successfully updated {len(update_processed_values)} records that had processed=true.")
     return len(update_processed_values)
