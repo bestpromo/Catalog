@@ -309,6 +309,7 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
                 skipped_count += 1
                 continue
         else:
+            # Inserção normal
             insert_data_full_ordered = OrderedDict()
             insert_data_full_ordered["created_at"] = row.get('created_at') or datetime.now()
             insert_data_full_ordered["import_batch_id"] = None
