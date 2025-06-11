@@ -222,11 +222,13 @@ def fetch_existing_offers(cur):
     return {(r['partner_id'], r['merchant_id'], r['offer_merchant_id']): r for r in cur.fetchall()}
 
 def prepare_insert_and_update(rows, existing_dict, partner_names):
-    """Prepara listas para inserção e atualização em lote."""
+    """Prepara listas para inserção e atualização em lote conforme regras de negócio."""
     insert_values = []
     insert_columns = None
-    update_error_records_values = []
+    update_processed_values = []
+    update_error_values = []
     skipped_count = 0
+    updated_processed_count = 0
     updated_error_count = 0
 
     base_new_record_keys = [
@@ -289,13 +291,17 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
         insert_data["upc"] = row.get('upc')
 
         if existing:
-            if existing['error_process']:
+            # Atualizar todos os campos se processed = true
+            if existing['processed'] is True:
                 staging_id = existing['staging_id']
-                old_reason = existing['reason_error'] or ""
-                log_line = f"{datetime.now().strftime('%d-%m-%Y')} - Import process to staging updated with new data from awin_catalog_import_temp and set error_process = false."
-                new_reason = (old_reason + "\n" if old_reason else "") + log_line
-                update_batch_values = list(insert_data.values()) + [new_reason, staging_id]
-                update_error_records_values.append(tuple(update_batch_values))
+                update_batch_values = list(insert_data.values()) + [None, None, None, staging_id]
+                update_processed_values.append(tuple(update_batch_values))
+                updated_processed_count += 1
+            # Atualizar campos e marcar error_process = false se error_process = true e processed is null
+            elif existing['error_process'] is True and existing['processed'] is None:
+                staging_id = existing['staging_id']
+                update_batch_values = list(insert_data.values()) + [False, staging_id]
+                update_error_values.append(tuple(update_batch_values))
                 updated_error_count += 1
             else:
                 skipped_count += 1
@@ -313,11 +319,11 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
             if insert_columns is None:
                 insert_columns = base_new_record_keys
             insert_values.append(list(insert_data_full_ordered.values()))
-    return insert_values, insert_columns, update_error_records_values, skipped_count, updated_error_count
+    return insert_values, insert_columns, update_processed_values, update_error_values, skipped_count, updated_processed_count, updated_error_count
 
-def batch_update_error_records(cur, update_error_records_values, insert_data):
-    """Atualiza registros com error_process=True."""
-    if not update_error_records_values:
+def batch_update_processed_records(cur, update_processed_values, insert_data):
+    """Atualiza registros com processed=True (zera processed e error_process)."""
+    if not update_processed_values:
         return 0
     update_set_parts = []
     for k in insert_data.keys():
@@ -327,13 +333,33 @@ def batch_update_error_records(cur, update_error_records_values, insert_data):
     update_sql = f"""
         UPDATE public.import_offers_staging
         SET {update_set_clause},
-            error_process = false,
-            reason_error = %s 
-        WHERE staging_id = %s 
+            processed = %s,
+            error_process = %s,
+            reason_error = %s
+        WHERE staging_id = %s
     """
-    cur.executemany(update_sql, update_error_records_values)
-    logging.info(f"Successfully updated {len(update_error_records_values)} records that had error_process=true.")
-    return len(update_error_records_values)
+    cur.executemany(update_sql, update_processed_values)
+    logging.info(f"Successfully updated {len(update_processed_values)} records that had processed=true.")
+    return len(update_processed_values)
+
+def batch_update_error_records(cur, update_error_values, insert_data):
+    """Atualiza registros com error_process=True e processed is null."""
+    if not update_error_values:
+        return 0
+    update_set_parts = []
+    for k in insert_data.keys():
+        sql_col_name = f'"{k}"' if k in ["condition", "attributes"] else k
+        update_set_parts.append(f"{sql_col_name} = %s")
+    update_set_clause = ', '.join(update_set_parts)
+    update_sql = f"""
+        UPDATE public.import_offers_staging
+        SET {update_set_clause},
+            error_process = %s
+        WHERE staging_id = %s
+    """
+    cur.executemany(update_sql, update_error_values)
+    logging.info(f"Successfully updated {len(update_error_values)} records that had error_process=true and processed is null.")
+    return len(update_error_values)
 
 def batch_insert_copy(cur, insert_values, insert_columns):
     """Insere novos registros usando COPY."""
@@ -420,17 +446,22 @@ def main():
         create_temp_keys_table(cur, offer_keys)
         existing_dict = fetch_existing_offers(cur)
 
-        insert_values, insert_columns, update_error_records_values, skipped_count, updated_error_count = prepare_insert_and_update(
+        insert_values, insert_columns, update_processed_values, update_error_values, skipped_count, updated_processed_count, updated_error_count = prepare_insert_and_update(
             rows, existing_dict, partner_names
         )
 
         logging.info(f"Prepared {len(insert_values)} records for new insert.")
+        logging.info(f"Prepared {updated_processed_count} records for processed update.")
         logging.info(f"Prepared {updated_error_count} records for error_process update.")
         logging.info(f"Skipped {skipped_count} existing records (already processed and no error).")
 
-        # Atualiza registros com erro
-        if update_error_records_values:
-            batch_update_error_records(cur, update_error_records_values, OrderedDict(insert_values[0]) if insert_values else OrderedDict())
+        # Atualiza registros com processed = true
+        if update_processed_values:
+            batch_update_processed_records(cur, update_processed_values, OrderedDict(insert_values[0]) if insert_values else OrderedDict())
+
+        # Atualiza registros com error_process = true e processed is null
+        if update_error_values:
+            batch_update_error_records(cur, update_error_values, OrderedDict(insert_values[0]) if insert_values else OrderedDict())
 
         # Insere novos registros
         inserted_count = batch_insert_copy(cur, insert_values, insert_columns)
@@ -443,7 +474,7 @@ def main():
 
     elapsed = time.time() - start_time
     logging.info(f"Import process finished. Total time: {elapsed:.2f} seconds.")
-    logging.info(f"Summary: Inserted new records: {inserted_count}, Updated error records: {updated_error_count}, Skipped records: {skipped_count}.")
+    logging.info(f"Summary: Inserted new records: {inserted_count}, Updated processed records: {updated_processed_count}, Updated error records: {updated_error_count}, Skipped records: {skipped_count}.")
 
 if __name__ == "__main__":
     main()
