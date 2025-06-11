@@ -370,8 +370,11 @@ def batch_update_error_records(cur, update_error_values, update_field_names):
 
 def batch_insert_copy(cur, insert_values, insert_columns):
     """Insere novos registros usando COPY."""
-    if not insert_values or not insert_columns:
-        logging.error("insert_columns not defined, cannot proceed with COPY for inserts.")
+    if not insert_values:
+        logging.info("Nenhum registro novo para inserir, COPY não será executado.")
+        return 0
+    if not insert_columns:
+        logging.warning("Nenhum registro novo para inserir, portanto insert_columns não foi definido. COPY não será executado.")
         return 0
     sio = io.StringIO()
     for record_tuple in insert_values:
@@ -401,7 +404,7 @@ def batch_insert_copy(cur, insert_values, insert_columns):
         logging.info(f"COPY successful for {len(insert_values)} new records.")
         return len(insert_values)
     except Exception as e:
-        logging.error(f"Error during COPY operation: {e}")
+        logging.error(f"Erro real durante a operação COPY: {e}")
         cur.connection.rollback()
         logging.info("Fallback to executemany due to COPY error (actual fallback not implemented here).")
         return 0
