@@ -29,7 +29,7 @@ from db import connect_db as get_connection
 # Load .env variables
 load_dotenv()
 BATCH_SIZE = int(os.getenv("AWIN_IMPORT_BATCH_SIZE", 1000))  # Total de ofertas a processar por execução
-MAX_PROCESSES = 4  # Limite de processos simultâneos
+MAX_PROCESSES = 8  # Limite de processos simultâneos
 
 def parse_price(value):
     if not value:
