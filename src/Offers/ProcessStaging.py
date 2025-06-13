@@ -23,7 +23,7 @@ import psycopg2
 import psycopg2.extras
 
 BATCH_SIZE = 500000
-MAX_PROCESSES = 10
+MAX_PROCESSES = 4
 
 LOG_TYPES = ["error", "warning", "critical", "qty"]
 LOG_DIR = os.path.join(os.path.dirname(__file__), "data", "logs")
