@@ -9,20 +9,8 @@ from dotenv import load_dotenv
 from collections import OrderedDict
 import re
 import io
-import subprocess
-
-# Lockfile atômico para evitar execuções simultâneas (robusto para uso com cron)
-LOCKFILE = '/tmp/importstaging.lock'
-try:
-    fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    os.write(fd, str(os.getpid()).encode())
-    os.close(fd)
-except FileExistsError:
-    print("Processo abortado: ImportStaging.py já está em execução.")
-    sys.exit(0)
-
-import atexit
-atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
+from multiprocessing import Pool, current_process
+import gc
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "data", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -40,10 +28,10 @@ from db import connect_db as get_connection
 
 # Load .env variables
 load_dotenv()
-BATCH_SIZE = int(os.getenv("AWIN_IMPORT_BATCH_SIZE", 50000))
+BATCH_SIZE = int(os.getenv("AWIN_IMPORT_BATCH_SIZE", 1000))  # Total de ofertas a processar por execução
+MAX_PROCESSES = 8  # Limite de processos simultâneos
 
 def parse_price(value):
-    """Cleans and converts a text value to float."""
     if not value:
         return None
     value = re.sub(r'[^\d,.-]', '', value)
@@ -57,12 +45,10 @@ def parse_price(value):
         return None
 
 def build_prices(row):
-    """Applies price rules and returns an OrderedDict with currency, price, and promotional_price."""
     currency = row.get("currency")
     search_price = parse_price(row.get("search_price"))
     product_price_old = parse_price(row.get("product_price_old"))
     rrp_price = parse_price(row.get("rrp_price"))
-
     if rrp_price is not None:
         return OrderedDict([
             ("currency", currency),
@@ -88,7 +74,6 @@ def build_prices(row):
     ])
 
 def build_images(row):
-    """Builds the images field as a list of dicts with alt, url, main_image, display_order."""
     images = []
     order_fields = [
         ('merchant_image_url', 'Main thumb'),
@@ -147,7 +132,6 @@ def build_images(row):
     return images
 
 def build_raw_data(row):
-    """Builds the raw_data field with the columns custom_1 to custom_9."""
     raw = []
     for i in range(1, 10):
         key = f'custom_{i}'
@@ -156,7 +140,6 @@ def build_raw_data(row):
     return raw if raw else None
 
 def build_attributes(row):
-    """Builds the attributes field with the columns: colour, fashion_suitable_for, fashion_category, fashion_size, fashion_material."""
     attrs = []
     for attr in ['colour', 'fashion_suitable_for', 'fashion_category', 'fashion_size', 'fashion_material']:
         if row.get(attr):
@@ -164,7 +147,6 @@ def build_attributes(row):
     return attrs if attrs else None
 
 def build_logistics(row):
-    """Builds the logistics field with the columns: delivery_weight, warranty, delivery_time, delivery_cost."""
     logistics = []
     for attr in ['delivery_weight', 'warranty', 'delivery_time', 'delivery_cost']:
         if row.get(attr):
@@ -172,7 +154,6 @@ def build_logistics(row):
     return logistics if logistics else None
 
 def build_stock_qty(row):
-    """Converts stock_quantity to int if possible."""
     try:
         if row.get('stock_quantity'):
             return int(row['stock_quantity'])
@@ -181,23 +162,42 @@ def build_stock_qty(row):
     return None
 
 def get_partner_names(cur):
-    """Returns a dict mapping partner_id to partner_name."""
     cur.execute("SELECT id, nome FROM public.partners")
     partners = cur.fetchall()
     return {p['id']: p['nome'] for p in partners}
 
-def fetch_rows(cur, batch_size):
-    """Fetches rows to process from awin_catalog_import_temp."""
-    cur.execute("""
-        SELECT * FROM public.awin_catalog_import_temp
-        WHERE imported = false
+def fetch_rows(cur, batch_size, offset):
+    # Deduplicação no SQL (CTE com ROW_NUMBER)
+    cur.execute(f"""
+        WITH ranked AS (
+            SELECT
+                id, partner_id, merchant_id, merchant_product_id, merchant_name, aw_deep_link,
+                merchant_deep_link, product_name, condition, product_short_description, description,
+                brand_name, product_type, merchant_category, category_name, merchant_product_category_path,
+                merchant_product_second_category, search_price, product_price_old, rrp_price, currency,
+                merchant_image_url, large_image, alternate_image, aw_thumb_url, alternate_image_two,
+                alternate_image_three, alternate_image_four, custom_1, custom_2, custom_3, custom_4,
+                custom_5, custom_6, custom_7, custom_8, custom_9, product_gtin, mpn, ean, isbn, upc,
+                stock_quantity, data_feed_id
+            FROM public.awin_catalog_import_temp
+            WHERE imported = false
+        ),
+        deduped AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY partner_id, merchant_id, merchant_product_id
+                       ORDER BY data_feed_id DESC
+                   ) as rn
+            FROM ranked
+        )
+        SELECT * FROM deduped
+        WHERE rn = 1
         ORDER BY id
-        LIMIT %s
-    """, (batch_size,))
+        LIMIT %s OFFSET %s
+    """, (batch_size, offset))
     return cur.fetchall()
 
 def create_temp_keys_table(cur, offer_keys):
-    """Creates and populates a temporary table with offer keys."""
     cur.execute("""
         CREATE TEMP TABLE temp_keys (
             partner_id INT,
@@ -210,7 +210,6 @@ def create_temp_keys_table(cur, offer_keys):
         cur.execute(f"INSERT INTO temp_keys (partner_id, merchant_id, offer_merchant_id) VALUES {args_str}")
 
 def fetch_existing_offers(cur):
-    """Fetches existing offers from import_offers_staging that match temp_keys."""
     cur.execute("""
         SELECT s.partner_id, s.merchant_id, s.offer_merchant_id, s.staging_id, s.error_process, s.processed, s.reason_error
         FROM public.import_offers_staging s
@@ -221,8 +220,13 @@ def fetch_existing_offers(cur):
     """)
     return {(r['partner_id'], r['merchant_id'], r['offer_merchant_id']): r for r in cur.fetchall()}
 
+def is_true(val):
+    return val is True or val == 1 or val == 't' or val == 'True' or val == 'true'
+
+def is_false(val):
+    return val is False or val == 0 or val == 'f' or val == 'False' or val == 'false'
+
 def prepare_insert_and_update(rows, existing_dict, partner_names):
-    """Prepara listas para inserção e atualização em lote conforme regras de negócio."""
     insert_values = []
     insert_columns = None
     update_processed_values = []
@@ -231,7 +235,6 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
     updated_processed_count = 0
     updated_error_count = 0
 
-    # Campos para INSERT (todos os campos)
     base_new_record_keys = [
         "created_at", "import_batch_id", "processed", "error_process", "reason_error",
         "processed_at", "partner_id", "partner_name", "merchant_id", "merchant_name",
@@ -242,7 +245,6 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
         "logistics", "stock_qty", "images", "raw_data", "gtin", "mpn", "ean",
         "isbn", "upc"
     ]
-    # Campos para UPDATE (apenas dados de oferta)
     update_field_names = [
         "partner_id", "partner_name", "merchant_id", "merchant_name", "deep_link_url",
         "status", "merchant_deep_link_url", "is_adult", "sku", "offer_title",
@@ -293,23 +295,26 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
         insert_data["upc"] = row.get('upc')
 
         if existing:
-            # Atualizar todos os campos se processed = true
-            if existing['processed'] is True:
+            # Se processed = true
+            if is_true(existing['processed']):
                 staging_id = existing['staging_id']
-                update_batch_values = [insert_data[k] for k in update_field_names] + [None, None, None, staging_id]
+                update_batch_values = [insert_data[k] for k in update_field_names] + [False, False, staging_id]
                 update_processed_values.append(tuple(update_batch_values))
                 updated_processed_count += 1
-            # Atualizar campos e marcar error_process = false se error_process = true e processed is null
-            elif existing['error_process'] is True and existing['processed'] is None:
+            # Se processed = false e error_process = true
+            elif is_false(existing['processed']) and is_true(existing['error_process']):
                 staging_id = existing['staging_id']
-                update_batch_values = [insert_data[k] for k in update_field_names] + [False, staging_id]
+                update_batch_values = [insert_data[k] for k in update_field_names] + [False, False, staging_id]
                 update_error_values.append(tuple(update_batch_values))
                 updated_error_count += 1
+            # Se processed = false e error_process = false: pula
+            elif is_false(existing['processed']) and is_false(existing['error_process']):
+                skipped_count += 1
+                continue
             else:
                 skipped_count += 1
                 continue
         else:
-            # Inserção normal
             insert_data_full_ordered = OrderedDict()
             insert_data_full_ordered["created_at"] = row.get('created_at') or datetime.now()
             insert_data_full_ordered["import_batch_id"] = None
@@ -330,7 +335,6 @@ def prepare_insert_and_update(rows, existing_dict, partner_names):
     )
 
 def batch_update_processed_records(cur, update_processed_values, update_field_names):
-    """Atualiza registros com processed=True (zera processed e error_process)."""
     if not update_processed_values:
         return 0
     update_set_parts = []
@@ -342,16 +346,13 @@ def batch_update_processed_records(cur, update_processed_values, update_field_na
         UPDATE public.import_offers_staging
         SET {update_set_clause},
             processed = %s,
-            error_process = %s,
-            reason_error = %s
+            error_process = %s
         WHERE staging_id = %s
     """
     cur.executemany(update_sql, update_processed_values)
-    logging.info(f"Successfully updated {len(update_processed_values)} records that had processed=true.")
     return len(update_processed_values)
 
 def batch_update_error_records(cur, update_error_values, update_field_names):
-    """Atualiza registros com error_process=True e processed is null."""
     if not update_error_values:
         return 0
     update_set_parts = []
@@ -362,20 +363,15 @@ def batch_update_error_records(cur, update_error_values, update_field_names):
     update_sql = f"""
         UPDATE public.import_offers_staging
         SET {update_set_clause},
+            processed = %s,
             error_process = %s
         WHERE staging_id = %s
     """
     cur.executemany(update_sql, update_error_values)
-    logging.info(f"Successfully updated {len(update_error_values)} records that had error_process=true and processed is null.")
     return len(update_error_values)
 
 def batch_insert_copy(cur, insert_values, insert_columns):
-    """Insere novos registros usando COPY."""
-    if not insert_values:
-        logging.info("Nenhum registro novo para inserir, COPY não será executado.")
-        return 0
-    if not insert_columns:
-        logging.warning("Nenhum registro novo para inserir, portanto insert_columns não foi definido. COPY não será executado.")
+    if not insert_values or not insert_columns:
         return 0
     sio = io.StringIO()
     for record_tuple in insert_values:
@@ -400,58 +396,31 @@ def batch_insert_copy(cur, insert_values, insert_columns):
     sio.seek(0)
     try:
         copy_sql = f"COPY public.import_offers_staging ({', '.join(insert_columns)}) FROM STDIN WITH (FORMAT text, DELIMITER '\t', NULL '\\N')"
-        logging.info(f"Attempting COPY for {len(insert_values)} new records into columns: {', '.join(insert_columns)}")
         cur.copy_expert(sql=copy_sql, file=sio)
-        logging.info(f"COPY successful for {len(insert_values)} new records.")
         return len(insert_values)
     except Exception as e:
         logging.error(f"Erro real durante a operação COPY: {e}")
         cur.connection.rollback()
-        logging.info("Fallback to executemany due to COPY error (actual fallback not implemented here).")
         return 0
     finally:
         sio.close()
 
 def mark_imported(cur, ids):
-    """Marca registros como importados."""
     if ids:
         cur.execute("UPDATE public.awin_catalog_import_temp SET imported = true WHERE id = ANY(%s)", (ids,))
 
-def deduplicate_rows_by_data_feed_id(rows):
-    """
-    Remove duplicados mantendo apenas o registro com maior data_feed_id para cada chave.
-    """
-    deduped = {}
-    for row in rows:
-        key = (row['partner_id'], row['merchant_id'], row['merchant_product_id'])
-        current = deduped.get(key)
-        # Considera maior data_feed_id (converte para int se necessário)
-        try:
-            row_data_feed_id = int(row['data_feed_id'])
-            current_data_feed_id = int(current['data_feed_id']) if current else None
-        except Exception:
-            row_data_feed_id = row['data_feed_id']
-            current_data_feed_id = current['data_feed_id'] if current else None
-        if current is None or row_data_feed_id > current_data_feed_id:
-            deduped[key] = row
-    return list(deduped.values())
-
-def main():
+def process_batch(args):
+    offset, batch_per_process = args
     start_time = time.time()
-    logging.info("Start of import process to import_offers_staging.")
-
+    logging.info(f"[{current_process().name}] Start batch at offset {offset} (limit {batch_per_process})")
     with get_connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         partner_names = get_partner_names(cur)
-        rows = fetch_rows(cur, BATCH_SIZE)
-        logging.info(f"Fetched {len(rows)} rows from awin_catalog_import_temp to process.")
+        rows = fetch_rows(cur, batch_per_process, offset)
+        logging.info(f"[{current_process().name}] Fetched {len(rows)} rows from awin_catalog_import_temp.")
 
         if not rows:
-            logging.info("No rows to process from awin_catalog_import_temp.")
+            logging.info(f"[{current_process().name}] No rows to process.")
             return
-
-        # Deduplicação: mantém só o maior data_feed_id por chave
-        rows = deduplicate_rows_by_data_feed_id(rows)
-        logging.info(f"After deduplication, {len(rows)} unique rows remain for processing.")
 
         offer_keys = [(row['partner_id'], row['merchant_id'], row['merchant_product_id']) for row in rows]
         create_temp_keys_table(cur, offer_keys)
@@ -464,31 +433,72 @@ def main():
             update_field_names
         ) = prepare_insert_and_update(rows, existing_dict, partner_names)
 
-        logging.info(f"Prepared {len(insert_values)} records for new insert.")
-        logging.info(f"Prepared {updated_processed_count} records for processed update.")
-        logging.info(f"Prepared {updated_error_count} records for error_process update.")
-        logging.info(f"Skipped {skipped_count} existing records (already processed and no error).")
-
-        # Atualiza registros com processed = true
         if update_processed_values:
             batch_update_processed_records(cur, update_processed_values, update_field_names)
-
-        # Atualiza registros com error_process = true e processed is null
         if update_error_values:
             batch_update_error_records(cur, update_error_values, update_field_names)
-
-        # Insere novos registros
         inserted_count = batch_insert_copy(cur, insert_values, insert_columns)
-
-        # Marca como importados
         ids_to_mark_imported = [row['id'] for row in rows]
         mark_imported(cur, ids_to_mark_imported)
-
         conn.commit()
 
+        # Libere listas após uso para liberar RAM
+        del rows, insert_values, update_processed_values, update_error_values, existing_dict
+        gc.collect()
+
     elapsed = time.time() - start_time
-    logging.info(f"Import process finished. Total time: {elapsed:.2f} seconds.")
-    logging.info(f"Summary: Inserted new records: {inserted_count}, Updated processed records: {updated_processed_count}, Updated error records: {updated_error_count}, Skipped records: {skipped_count}.")
+    logging.info(f"[{current_process().name}] Batch finished. Time: {elapsed:.2f}s. Inserted: {inserted_count}, Updated processed: {updated_processed_count}, Updated error: {updated_error_count}, Skipped: {skipped_count}.")
+
+def main():
+    # Conta total de registros únicos a processar
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM public.awin_catalog_import_temp
+                WHERE imported = false
+                GROUP BY partner_id, merchant_id, merchant_product_id
+            ) t
+        """)
+        total = cur.fetchone()[0]
+    if total == 0:
+        logging.info("No records to process.")
+        return
+
+    # Calcula o tamanho do batch de cada processo para que o total não ultrapasse BATCH_SIZE
+    num_procs = min(MAX_PROCESSES, (BATCH_SIZE + 1) // 1)  # nunca mais que MAX_PROCESSES
+    batch_per_process = BATCH_SIZE // num_procs
+    remainder = BATCH_SIZE % num_procs
+
+    offsets = []
+    limits = []
+    for i in range(num_procs):
+        offset = i * batch_per_process
+        if i < remainder:
+            batch_this = batch_per_process + 1
+            offset += i  # distribui o resto
+        else:
+            batch_this = batch_per_process
+            offset += remainder
+        offsets.append((offset, batch_this))
+
+    with Pool(processes=num_procs) as pool:
+        pool.map(process_batch, offsets)
+
+    logging.info("Batch finished.")
 
 if __name__ == "__main__":
+    # Lockfile só no processo principal!
+    LOCKFILE = '/tmp/importstaging.lock'
+    try:
+        fd = os.open(LOCKFILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        print("Processo abortado: ImportStaging.py já está em execução.")
+        sys.exit(0)
+
+    import atexit
+    atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
+
     main()

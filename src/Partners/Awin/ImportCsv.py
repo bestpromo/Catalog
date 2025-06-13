@@ -70,6 +70,17 @@ def process_csv_file(filepath, conn, batch_size):
         for row in reader:
             if "partner_id" not in header or len(row) == len(header) - 1:
                 row = [AWIN_PARTNER_ID] + row
+
+            # --- Ajuste para brand_name ---
+            if "brand_name" in header:
+                idx = header.index("brand_name")
+                # Garante que a linha tem o mesmo número de colunas do header
+                while len(row) < len(header):
+                    row.append("")
+                if not row[idx] or row[idx].strip() == "":
+                    row[idx] = "Genérico"
+            # --- Fim do ajuste ---
+
             batch.append(row)
             if len(batch) >= batch_size:
                 copy_batch(conn, header, batch)
